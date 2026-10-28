@@ -103,6 +103,71 @@ function Install-RequiredCommand($Name, $PackageId, $Hint) {
     $env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
     Assert-Command $Name $Hint
 }
+
+# ---- 包管理器：uv 优先，pip 兜底（与 setup.sh 的 select_python_tool 对等）----
+# 为什么要有这一步：uv 的依赖解析比 pip 快一个量级，且只写用户目录，不需要管理员。
+# 但它是加速手段、不是安装前提 —— 装不上或跑挂了都退回 pip 继续装完，与 setup.sh 的
+# fail-soft 规则保持一致。EASEL_PYTHON_TOOL=auto|uv|pip 可强制指定。
+# 函数名用 Test-*/Update-*/Install-*/Select-* 这些 approved verb：PSScriptAnalyzer 的
+# PSUseApprovedVerbs 虽然只是 Warning，但没必要在自己的改动里制造噪音。
+function Test-ToolExists([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+
+function Update-SessionPath {
+    # winget 与 uv 官方安装器都只改「用户环境变量」，当前进程的 $env:Path 不会自动刷新，
+    # 不重新拼一次就会出现「明明装好了、Get-Command 还是找不到」。
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = $machine + ';' + $user
+}
+
+function Install-Uv {
+    Info '未找到 uv，尝试用户级安装（不写系统目录）...'
+    if (Test-ToolExists 'winget') {
+        & winget install --id astral-sh.uv --exact --accept-source-agreements --accept-package-agreements
+        Update-SessionPath
+        if (Test-ToolExists 'uv') { return $true }
+    }
+    # winget 不可用或被策略拦住时用官方安装脚本，同样只写 %USERPROFILE%\.local\bin。
+    # 用 -OutFile 落地再调用，而不是 `irm | Invoke-Expression`：后者会让
+    # PSScriptAnalyzer 报 AvoidUsingInvokeExpression，也让「到底执行了什么」不可见。
+    # Invoke-RestMethod -OutFile 不写 Zone.Identifier，RemoteSigned 策略下仍可运行。
+    $installer = Join-Path ([System.IO.Path]::GetTempPath()) 'easel-uv-install.ps1'
+    try {
+        Invoke-RestMethod 'https://astral.sh/uv/install.ps1' -UseBasicParsing -OutFile $installer
+        & $installer
+    } catch {
+        Write-Host "  [!] uv 官方安装脚本执行失败：$($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        Remove-Item $installer -Force -ErrorAction SilentlyContinue
+    }
+    Update-SessionPath
+    if (-not (Test-ToolExists 'uv')) {
+        $uvBin = Join-Path $env:USERPROFILE '.local\bin'
+        if (Test-Path $uvBin) { $env:Path = $uvBin + ';' + $env:Path }
+    }
+    return (Test-ToolExists 'uv')
+}
+
+function Select-PythonTool {
+    $choice = "$env:EASEL_PYTHON_TOOL".Trim().ToLower()
+    if ($choice -eq 'pip') { return 'pip' }
+    if ($choice -eq 'uv') { return 'uv' }
+    # 没有 pyproject.toml 说明当前目录不是可安装的项目（典型：只把脚本拷出来跑）。
+    # 这种目录交给 uv 只会得到 "does not appear to be a Python project"，还白建一个 .venv。
+    if (-not (Test-Path (Join-Path $Root 'pyproject.toml'))) {
+        Warn "未找到 $Root\pyproject.toml，跳过 uv 改用 pip 路径"
+        return 'pip'
+    }
+    if (Test-ToolExists 'uv') { return 'uv' }
+    if (Install-Uv) {
+        $uvVersion = (Invoke-NativeCapture 'uv' @('--version')).Output.Trim()
+        if ($uvVersion) { Ok $uvVersion }
+        return 'uv'
+    }
+    Warn 'uv 不可用，回退 pip（依赖安装会更慢）'
+    return 'pip'
+}
+
 function Read-EnvFile($Path) {
     $values = @{}
     # 显式 -Encoding UTF8：PS 5.1 的 Get-Content 默认按系统 ANSI 代码页解码，
@@ -295,9 +360,27 @@ if (-not $pythonCommand -and (Get-Command py -ErrorAction SilentlyContinue)) { $
 if (-not $pythonCommand) { Fail '未找到可运行的 Python 3；请安装 Python 3.10+。' }
 & $pythonCommand @pythonArgs -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
 if ($LASTEXITCODE -ne 0) { Fail 'Python 3.10+ 是必需依赖。' }
-if (-not (Test-Path $Venv)) { Info '创建 Python 虚拟环境...'; & $pythonCommand @pythonArgs -m venv $Venv }
+$PyTool = Select-PythonTool
+if (-not (Test-Path $Venv)) {
+    Info '创建 Python 虚拟环境...'
+    $venvOk = $false
+    if ($PyTool -eq 'uv') {
+        # --seed 让 venv 里带 pip：保住 `pip install` 的习惯，也让 EASEL_PYTHON_TOOL=pip
+        # 复用同一个 venv 时不至于没有 pip。
+        & uv venv --seed $Venv
+        $venvOk = ($LASTEXITCODE -eq 0)
+        if (-not $venvOk) {
+            Warn 'uv venv --seed 失败，改用不带 seed 的 uv venv'
+            & uv venv $Venv
+            $venvOk = ($LASTEXITCODE -eq 0)
+        }
+        if (-not $venvOk) { Warn 'uv 创建 venv 失败，回退 python -m venv' }
+    }
+    # uv 两条路径都失败时仍要能装：系统 Python 的 venv 是最后一条 fail-soft 路径。
+    if (-not $venvOk) { & $pythonCommand @pythonArgs -m venv $Venv }
+}
 if (-not (Test-Path $Python)) { Fail 'Python venv 创建失败。' }
-Ok '系统环境检查完成'
+Ok "系统环境检查完成（Python 依赖安装工具：$PyTool）"
 
 if (-not $SkipOpenClaw) {
 Step '2/8' '检测 OpenClaw' '已有安装将直接复用'
@@ -307,10 +390,24 @@ Assert-Command 'openclaw' '请确认 npm 全局 bin 已加入 PATH。'
 }
 Step '3/8' '安装 Easel 运行依赖' 'Web · 媒体 · 浏览器发布'
 Info '安装 Easel Python 依赖...'
-& $Python -m pip install --upgrade pip --progress-bar on
-if ($LASTEXITCODE -ne 0) { Fail 'pip 升级失败。' }
-& $Python -m pip install -e $Root --prefer-binary --progress-bar on
-if ($LASTEXITCODE -ne 0) { Fail 'Easel Python 依赖安装失败。' }
+# uv 是加速手段：它失败必须能退回 pip，否则一次 resolver / 索引故障就让整个安装停在这里。
+# 注意 uv 的 `pip install` 没有 --prefer-binary（它默认优先 wheel），也没有 --progress-bar。
+$installed = $false
+if ($PyTool -eq 'uv') {
+    Info '使用 uv 安装（失败会自动回退 pip）'
+    & uv pip install -e $Root --python $Python
+    $installed = ($LASTEXITCODE -eq 0)
+    if (-not $installed) { Warn 'uv 安装依赖失败，回退 pip 重试（会更慢）' }
+}
+if (-not $installed) {
+    & $Python -m pip install --upgrade pip --progress-bar on
+    if ($LASTEXITCODE -ne 0) { Fail 'pip 升级失败。' }
+    & $Python -m pip install -e $Root --prefer-binary --progress-bar on
+    if ($LASTEXITCODE -ne 0) {
+        if ($PyTool -eq 'uv') { Fail 'Easel Python 依赖安装失败（uv 与 pip 都试过了）。' }
+        Fail 'Easel Python 依赖安装失败。'
+    }
+}
 Step '4/8' '构建 Web 工作台' 'React production bundle'
 Info '构建 Web 前端...'
 $Frontend = Join-Path $Root 'web\frontend'
@@ -586,14 +683,15 @@ if ($SkipOpenClaw) {
     -not (Test-UsableKey $envValues['EASEL_LLM_API_KEY'])) {
     Write-Host ''
     Write-Host '  下一步：在浏览器里配置模型' -ForegroundColor Yellow
-    Write-Host "    1. $Venv\Scripts\easel.exe web" -ForegroundColor Cyan
+    Write-Host "    1. $Venv\Scripts\easel.exe up" -ForegroundColor Cyan
     Write-Host '    2. 打开 http://localhost:7860' -ForegroundColor Cyan
     Write-Host '    3. 左下角设置 -> 模型配置 -> 填 API Key -> 保存' -ForegroundColor Cyan
     Write-Host '  保存后 Easel 会自动写好 openclaw 配置并重启网关，不用再跑 setup.ps1。' -ForegroundColor DarkGray
 }
 Write-Host ''
-Write-Host "  启动 Web：$Venv\Scripts\easel.exe web" -ForegroundColor Cyan
-Write-Host "  检查环境：$Venv\Scripts\easel.exe doctor" -ForegroundColor Cyan
+Write-Host "  启动（gateway + Web）：$Venv\Scripts\easel.exe up" -ForegroundColor Cyan
+Write-Host "  只启动 Web：          $Venv\Scripts\easel.exe web" -ForegroundColor Cyan
+Write-Host "  检查环境：            $Venv\Scripts\easel.exe doctor" -ForegroundColor Cyan
 if (-not $SkipOpenClaw) {
     Write-Host '  默认执行引擎：OpenClaw；Web 设置可切换到已安装的 Codex、OpenCode 或其它 ACP 引擎。' -ForegroundColor DarkGray
 }

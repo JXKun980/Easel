@@ -14,6 +14,9 @@ build/
 .env.xhs
 # setup.sh 默认把 Python 依赖装进项目内的 .venv（见 setup.sh 的虚拟环境分支）
 .venv/
+# 刻意不提交 uv.lock：文档里的 uv 入口是 `uv run --no-sync`（复用项目 .venv、不重新解析）。
+# 裸 `uv run` 会顺手写一个 1MB+ 的 lockfile，忽略它以免误提交与 lockfile 漂移。
+uv.lock
 
 # Docker
 docker/data/

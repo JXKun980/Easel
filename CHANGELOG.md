@@ -2,6 +2,35 @@
 
 All notable changes to Easel are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added `easel up`, which starts the OpenClaw gateway (reusing a healthy one) and then the Web workspace, so a single command — `uv run --no-sync easel up` — brings up both. `Ctrl+C` stops only the gateway this run started; `--keep-gateway` leaves it running and `--no-gateway` skips it. When the configured engine needs no gateway (direct API, Codex, OpenCode), it goes straight to the Web UI.
+- `easel up` / `easel web` now take their default port from `EASEL_PORT` (environment or `.env`), so a non-default port no longer has to be passed on every invocation. This matters on WSL, where Windows reserves TCP 7409–7979: `localhost:7860` can never be mirrored by `wslrelay`, and the failure is silent (connection refused, nothing logged).
+
+### Improved
+
+- `setup.sh` now prefers **uv** for Python dependencies and **pnpm** for the Web frontend. Either tool is installed into the user directory when missing (`astral.sh/uv` installer, `npm install -g pnpm`) and the installer falls back to pip / npm if that fails, so the previous path still works unchanged.
+- uv removes the `python3-venv` prerequisite: `python3 -m venv` aborts on minimal images without `ensurepip` (Ubuntu without `python3-venv`), and non-interactive installs previously warned and fell back to system Python. Both now create `.venv` with `uv venv --seed`.
+- Added `web/frontend/pnpm-lock.yaml`, generated from the existing `package-lock.json` with `pnpm import`, so the pnpm path installs with `--frozen-lockfile`. `package-lock.json` is kept for the npm fallback.
+- Added `EASEL_PYTHON_TOOL` (`auto|uv|pip`) and `EASEL_NODE_TOOL` (`auto|pnpm|npm`) to pin either package manager.
+- Tool detection now ignores WSL-interop binaries under `/mnt/`. A Windows `node` / `npm` / `pnpm` on `PATH` can no longer be mistaken for a Linux toolchain, which used to install dependencies against Windows paths.
+
+### Fixed
+
+- Browser login/publishing no longer fails silently on minimal Linux images. `setup.sh` now installs Playwright's Chromium **system** dependencies (`playwright install-deps chromium`; skipped without root, with the manual command reported instead), and both the installer and `easel doctor` verify a real headless launch instead of only checking that the browser binary exists. Previously `playwright install chromium` reported success while the process exited with code 127 (`libnspr4.so: cannot open shared object file`), so every login attempt ended with “browser couldn't open” — a reason visible only in `outputs/_login/`.
+- `Playwright Chromium` in `easel doctor` now distinguishes “not downloaded” from “downloaded but cannot launch”, and the failure hint points at `install-deps` rather than suggesting a re-download that cannot help.
+- Installer summary and post-install hints now lead with `easel up` instead of `easel web`.
+- The uv path in `setup.sh` is now fail-soft end to end. Missing `uv` is installed into `~/.local/bin` through the official installer (curl, with a wget fallback — minimal images often ship only one); directories without `pyproject.toml` never enable uv, so it can no longer fail with “does not appear to be a Python project”; and if `uv pip install -e` fails, the installer retries once with pip instead of aborting under `set -e`. The `uv venv` step gained the same final fallback to `python3 -m venv`.
+- `setup.ps1` gained the same uv support as `setup.sh`, so native Windows installs resolve dependencies faster. `uv` is installed into the user directory through `winget` (official installer as fallback) when missing; `.venv` is created with `uv venv --seed`; dependencies install with `uv pip install -e … --python <venv>` and fall back to pip on failure. `EASEL_PYTHON_TOOL=auto|uv|pip` overrides the choice, and a directory without `pyproject.toml` never enables uv.
+
+### Notes
+
+- Global OpenClaw still installs through npm by design: pnpm's global bin depends on `PNPM_HOME`, and pnpm 10+ blocks dependency postinstall scripts, which OpenClaw's bundled plugins rely on.
+- Venv activation is no longer documented as a required step: the generated `easel` console script carries an absolute shebang into `.venv/bin/python`, so `.venv/bin/easel <cmd>` runs without `source .venv/bin/activate`. The documented uv entry point is `uv run --no-sync easel web`; plain `uv run` resolves dependencies and writes a 1 MB+ `uv.lock`, so `uv.lock` is intentionally untracked (`.gitignore`) to keep the env unpinned unless a lockfile is deliberately adopted.
+- Added `.gitattributes` pinning `*.sh` and lockfiles to LF. A Windows checkout with `core.autocrlf=true` otherwise hands `bash setup.sh` a CRLF script, which fails with `$'\r': command not found`.
+
 ## [0.3.0] - 2026-10-12
 
 ### Added

@@ -186,12 +186,23 @@ Requirements: Linux, macOS, or Windows 10/11, Python 3.10+, and Git. The install
 git clone git@github.com:ZJU-REAL/Easel.git
 cd Easel
 bash setup.sh
-source .venv/bin/activate    # easel is installed in .venv; activate it first (Windows: .venv\Scripts\activate)
-easel web
-# Or: easel chat
+.venv/bin/easel up           # gateway + Web workspace in one go; Windows: .venv\Scripts\easel.exe up
+# Or: .venv/bin/easel web    # Web only, leaves the gateway alone
+# Or: .venv/bin/easel chat
 ```
 
-> If you see `easel: command not found`, the virtual environment is not activated. You can also run it by full path without activating, e.g. `.venv/bin/easel doctor` (Windows: `.venv\Scripts\easel.exe doctor`).
+> `easel` lives in the project `.venv`, and its console-script shebang already points at
+> `.venv/bin/python`, so **activation is optional**. Run `.venv/bin/easel <command>` directly, or with
+> uv: `uv run --no-sync easel up` (optionally `--project <repo>` from any directory). Plain `uv run`
+> without `--no-sync` syncs the environment from `pyproject.toml` and writes a 1 MB+ `uv.lock` — that
+> is a real dependency resolution, not just running a command. This project deliberately does not
+> track `uv.lock` (it is in `.gitignore`), so keep `--no-sync` unless you intend to pin and commit a
+> lockfile. Activate only when you want `easel`, `pip`, or `playwright` on `PATH`:
+> `source .venv/bin/activate` (Windows: `.venv\Scripts\activate`).
+>
+> `easel up` starts the OpenClaw gateway if it is not already healthy, reuses it when it is, then runs
+> the Web workspace. Ctrl+C stops only the gateway this command started. Use `--keep-gateway` to leave
+> it running, or `--no-gateway` to skip it entirely.
 
 For native Windows 10/11, run the following in PowerShell; WSL and Bash are not required:
 
@@ -204,13 +215,13 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\.venv\Scripts\easel.exe web
 ```
 
-The Windows installer uses `winget` to install missing system tools when available, creates `.venv`, installs Python and frontend dependencies, builds the Web UI, and installs Playwright Chromium. Easel uses an isolated `easel` OpenClaw profile. Windows PowerShell 5.1 is supported. Native installation and the Web/CLI entry points are available; broader Windows compatibility across individual skills and browser publishing is still being improved.
+The Windows installer uses `winget` to install missing system tools when available, creates `.venv`, installs Python and frontend dependencies, builds the Web UI, and installs Playwright Chromium. Python dependencies go through `uv` when available (installed into the user directory if missing) and fall back to `pip` automatically; only when both fail does the installer abort. Easel uses an isolated `easel` OpenClaw profile. Windows PowerShell 5.1 is supported. Native installation and the Web/CLI entry points are available — run `.\.venv\Scripts\easel.exe up` to start the gateway and the Web workspace together (`web` starts only the Web side); broader Windows compatibility across individual skills and browser publishing is still being improved.
 
 `bash setup.sh` is a rerunnable installer. It detects and reuses an existing local OpenClaw
 installation without touching `~/.openclaw/`; Easel uses its isolated `~/.openclaw-easel/` profile.
 
 **Configure your model API key in the browser — the installer no longer asks for it in the terminal.**
-After installing, run `easel web`; on first open it takes you straight to *Settings → Model config*.
+After installing, run `easel up`; on first open it takes you straight to *Settings → Model config*.
 Enter your key and save, and Easel writes the OpenClaw configuration and restarts the gateway for you
 — no need to rerun `setup.sh`. The panel can also list a provider's available models and run a
 connectivity self-test, neither of which the old terminal prompt could do. Alternatively, copy
@@ -222,7 +233,10 @@ gateway startup, missing model config — are collected into a summary at the en
 `outputs/_install/last-install.json` for `easel doctor` to repeat; the install itself still exits 0.
 Set `EASEL_SETUP_STRICT=1` to turn those warnings back into hard failures.
 
-Open `http://localhost:7860` for the Web workspace. Run `easel doctor` to check the environment and `easel ping` to verify the gateway and Agent connection.
+Open `http://localhost:7860` for the Web workspace. Change the port with `--port`, or set
+`EASEL_PORT=8188` in `.env` to make it the default for `easel up` / `easel web` (on WSL this matters:
+Windows reserves TCP 7409–7979, so `localhost:7860` cannot be forwarded from WSL). Run `easel doctor`
+to check the environment and `easel ping` to verify the gateway and Agent connection.
 
 When Easel runs on a server accessed through VSCode Remote SSH, forward server port `7860`
 in VSCode's Ports panel and open the displayed local forwarded address; the local port may differ.
@@ -231,9 +245,35 @@ The server's `localhost` is not your computer's. Do not expose an unauthenticate
 The installer installs the Python dependencies required by the Web UI, media processing, and browser publishing:
 
 ```bash
+# Recommended: uv creates the environment and installs dependencies
+# (roughly 10x faster than pip, and it does not need the system ensurepip)
+uv venv --seed .venv
+source .venv/bin/activate
+uv pip install -e .
+python -m playwright install chromium
+
+# Equivalent without uv
+python -m venv .venv && source .venv/bin/activate
 pip install -e .
 python -m playwright install chromium
 # FFmpeg is also required on the system.
+```
+
+The installer prefers **uv** for Python dependencies and **pnpm** for `web/frontend`. Both are
+installed into the user directory when missing and fall back to pip / npm if that fails, so the old
+path still works. Global OpenClaw keeps using npm: pnpm's global bin depends on `PNPM_HOME`, and it
+blocks dependency postinstall scripts by default, which OpenClaw's bundled plugins rely on. Force a
+specific path with:
+
+```bash
+EASEL_PYTHON_TOOL=pip EASEL_NODE_TOOL=npm bash setup.sh   # force pip/npm
+EASEL_PYTHON_TOOL=uv  EASEL_NODE_TOOL=pnpm bash setup.sh  # force uv/pnpm
+```
+
+You can build the frontend with pnpm by hand as well:
+
+```bash
+cd web/frontend && pnpm install --frozen-lockfile && pnpm run build
 ```
 
 ## ⚙️ Configuration
@@ -278,7 +318,8 @@ The Publishing Center offers **Automatic publishing / Human-reviewed publishing*
 
 | Command | Purpose |
 |---|---|
-| `easel web [--port 7860]` | Start the Web workspace |
+| `easel up [--port 7860]` | Start the gateway and the Web workspace together (Ctrl+C stops both; `--keep-gateway` keeps the gateway) |
+| `easel web [--port 7860]` | Start only the Web workspace, leaving the gateway alone |
 | `easel chat` | Start a multi-turn terminal conversation and select an account profile |
 | `easel skill <name> -i "..." [-p <profile>]` | Run a Skill directly; input may also be a file path |
 | `easel doctor` | Check Python, Node.js, OpenClaw, and essential configuration |

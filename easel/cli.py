@@ -3,6 +3,8 @@
 用法：
     easel chat                              # 新会话（选画像后进入）
     easel doctor                            # 检查环境
+    easel up                                # 一次启动 gateway + Web 工作台
+    easel web                               # 只启动 Web 工作台
     easel gateway {start|stop|status}       # 管理 gateway
     easel ping                              # 连通性测试
     easel skill <name> -i "..." -p <画像>   # 运行 SKILL
@@ -203,6 +205,105 @@ def cmd_chat(_args) -> int:
     return result.returncode
 
 
+def _default_port() -> int:
+    """Web 端口默认值：``EASEL_PORT``（.env 或环境变量）> 7860。
+
+    允许把端口钉在 .env 里，这样 ``easel up`` / ``easel web`` 不必每次带 ``--port``。
+    WSL 上尤其需要：Windows 保留的 7409-7979 区间会让 ``localhost:7860`` 无法从
+    Windows 侧转发（wslrelay 绑不上宿主回环端口，且静默失败），只能换一个端口。
+    """
+    try:
+        # read_settings 已经合并 os.environ（环境变量优先），这里不必再查一遍。
+        raw = str(read_settings(PROJECT_ROOT / ".env").get("EASEL_PORT", "") or "").strip()
+    except Exception:  # noqa: BLE001  .env 读不了不该阻塞启动，退回默认端口
+        raw = ""
+    if raw.isdigit() and 0 < int(raw) <= 65_535:
+        return int(raw)
+    return 7860
+
+
+def _gateway_healthy(timeout: float = 1.5) -> bool:
+    """回环探针：gateway ``/healthz`` 是否 200。
+
+    与 doctor / ping 同一条 doctrine：探针绝不能继承 ``http_proxy``，否则设置过代理的
+    环境里，活着的回环网关会被判成离线。
+    """
+    import urllib.error
+    import urllib.request
+
+    from easel.gateway_endpoint import healthz_url
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(healthz_url(), timeout=timeout) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _gateway_needed() -> bool:
+    """当前执行引擎是否需要 OpenClaw gateway（api / Codex / OpenCode 模式不需要）。"""
+    try:
+        runtime = harnesses.settings(PROJECT_ROOT / "outputs", read_settings())["runtime"]
+    except Exception:  # noqa: BLE001  判定失败按「需要」处理：多起一次 gateway 无害
+        return True
+    return runtime == "openclaw"
+
+
+def cmd_up(args) -> int:
+    """一次性启动 OpenClaw gateway + Web 工作台，Ctrl+C 一起收摊。
+
+    为什么要有这个命令：``easel web`` 只起 FastAPI，gateway 是另一条长驻进程
+    （``web/app.py`` 只探测它，探不到就退回每轮冷启动的 CLI 传输）。少打一条命令
+    不是重点，重点是**顺序和收尾**：先 gateway 后 web、退出时只停本次自己起的
+    gateway（复用已在跑的那个时不动它），否则很容易留下一个没人管的孤儿进程。
+    """
+    from easel.gateway_endpoint import describe
+
+    def say(message: str, *, err: bool = False) -> None:
+        # 启动期提示必须 flush。stdout 被重定向（日志、CI、`> file`）时 Python 是块缓冲，
+        # 不 flush 的话用户在 gateway 起来之前只会看到一片空屏。
+        print(message, file=sys.stderr if err else sys.stdout, flush=True)
+
+    started_gateway = False
+    if getattr(args, "no_gateway", False):
+        say(f"  {DIM}--no-gateway：只启动 Web，不动 gateway{NC}")
+    elif not _gateway_needed():
+        say(f"  {DIM}当前执行引擎不需要 OpenClaw gateway，直接启动 Web{NC}")
+    elif _gateway_healthy():
+        say(f"  {GREEN}gateway 已在运行{NC} {DIM}{describe()}{NC}")
+    else:
+        say(f"  {CYAN}启动 gateway…{NC}")
+        started_gateway = cmd_gateway(argparse.Namespace(action="start")) == 0
+        # gateway.sh 用 setsid 起进程后立刻返回，健康与否要自己等：40 × 0.25s ≈ 10s。
+        # start 本身就失败时不必等：进程根本没起来，等满 10s 只会拖慢报错。
+        if started_gateway:
+            for _ in range(40):
+                if _gateway_healthy(0.5):
+                    break
+                time.sleep(0.25)
+        if _gateway_healthy():
+            say(f"  {GREEN}gateway 就绪{NC} {DIM}{describe()}{NC}")
+        else:
+            started_gateway = False
+            say(f"  {YELLOW}gateway 没起来，Web 仍会启动{NC}"
+                f"（聊天会退回每轮冷启动的 CLI 传输）\n"
+                f"  {DIM}排查：bash scripts/gateway.sh status"
+                f"（日志 /tmp/easel-gateway.log）{NC}", err=True)
+
+    port = getattr(args, "port", 7860)
+    say(f"  Web 工作台：{CYAN}http://127.0.0.1:{port}{NC} {DIM}Ctrl+C 退出{NC}")
+    try:
+        return cmd_web(args)
+    except KeyboardInterrupt:
+        # 子进程已经收到同一个 SIGINT 并退出，这里只负责把退出码收敛成 0。
+        return 0
+    finally:
+        if started_gateway and not getattr(args, "keep_gateway", False):
+            say(f"\n  {DIM}停止本次启动的 gateway…{NC}")
+            cmd_gateway(argparse.Namespace(action="stop"))
+
+
 def cmd_web(args) -> int:
     """启动 Web 工作台（FastAPI + React），默认 http://localhost:7860。"""
     from easel.runtime_env import web_environment
@@ -258,9 +359,23 @@ def main(argv: list[str] | None = None) -> int:
     p_skill.set_defaults(func=cmd_skill)
 
     # web
+    # 端口默认值只算一次：它要读 .env，而 --help 的文案里得写出「实际生效的那个值」，
+    # 否则 .env 里设了 EASEL_PORT=8188、帮助里还印 7860，用户会以为设置没生效。
+    default_port = _default_port()
     p_web = sub.add_parser("web", help="启动 Web UI")
-    p_web.add_argument("--port", type=int, default=7860, help="端口（默认 7860）")
+    p_web.add_argument("--port", type=int, default=default_port,
+                       help=f"端口（默认 {default_port}；可用 EASEL_PORT 覆盖）")
     p_web.set_defaults(func=cmd_web)
+
+    # up：gateway + web 一条命令
+    p_up = sub.add_parser("up", help="一次性启动 gateway 和 Web 工作台")
+    p_up.add_argument("--port", type=int, default=default_port,
+                      help=f"Web 端口（默认 {default_port}；可用 EASEL_PORT 覆盖）")
+    p_up.add_argument("--no-gateway", action="store_true",
+                      help="只启动 Web，不碰 gateway")
+    p_up.add_argument("--keep-gateway", action="store_true",
+                      help="Ctrl+C 退出时保留本次启动的 gateway")
+    p_up.set_defaults(func=cmd_up)
 
     args = parser.parse_args(argv)
     try:

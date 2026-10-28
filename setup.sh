@@ -257,6 +257,42 @@ run_step() {   # $1 label  其余为命令
     "$@"
 }
 
+# ---- Playwright 的 Chromium 系统依赖 ----
+# 浏览器本体 ≠ 能启动：Playwright 的 Chromium 动态链接 libnss3 / libnspr4 /
+# libasound2，最小化的 Ubuntu/Debian 镜像默认没有这几个库。缺库时
+# `playwright install chromium` 依然报成功，但进程启动即退出码 127，用户点「登录」
+# 只看到「浏览器没能打开」（outputs/_login/ 里是 libnspr4.so: cannot open shared
+# object file）。所以这里补一步 install-deps，并在后面真启动一次做自检。
+#
+# 返回：0 已就绪/无需处理；2 需要 root 但没有免密 sudo（交给调用方提示手动命令）；
+#       其他非零 = 安装失败。
+playwright_system_deps() {   # $1 = python 解释器
+    local py="$1"
+    # macOS / Windows 的 Chromium 自带依赖，没有这一步，也不该报错。
+    [ "$(uname -s)" = Linux ] || return 0
+    # 只处理 apt 系：其他发行版用什么包名不好猜，宁可让调用方给手动命令。
+    command -v apt-get >/dev/null 2>&1 || return 2
+    if [ "$(id -u)" -eq 0 ]; then
+        "$py" -m playwright install-deps chromium
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo -n "$py" -m playwright install-deps chromium
+    else
+        return 2
+    fi
+}
+
+# 真启动一次 headless Chromium：缺库时上面那步可能被跳过（无 sudo），
+# 只有真启动能证明「浏览器登录/发布」这条路是通的。
+playwright_launch_selfcheck() {   # $1 = python 解释器
+    "$1" - <<'PY'
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True, timeout=60000)
+    browser.close()
+PY
+}
+
 # ---- 安装报告 ----
 # 把本次安装的遗留问题落盘，供 `easel doctor` 复述。这样「装完还差什么」不依赖用户
 # 记住十几分钟前滚过去的终端输出。
@@ -350,6 +386,114 @@ fi
 # 默认先走国内镜像再回落 nodejs.org：实测同一个包 nodejs.org ~20KB/s（20 分钟都下不完），
 # 阿里云 ~590KB/s（53 秒）。EASEL_NODE_MIRROR 可覆盖，镜像目录结构需与 nodejs.org/dist 一致。
 NODE_MIRROR_DEFAULT="https://mirrors.aliyun.com/nodejs-release"
+
+# ---- 0b. 包管理器：uv / pnpm 优先，pip / npm 兜底 ----
+# EASEL_PYTHON_TOOL=auto|uv|pip    EASEL_NODE_TOOL=auto|pnpm|npm
+#
+# 为什么默认换工具而不是换流程：uv 与 pnpm 都只写用户目录（不需要 sudo），解析依赖比
+# pip / npm 快一个量级，且 uv 在没有 ensurepip 的精简镜像上也能建 venv —— 而
+# `python3 -m venv` 在那种镜像上会直接失败（Ubuntu 未装 python3-venv 时的经典故障）。
+#
+# 但两者都不是安装的前提：任何一个装不上，本脚本就退回 pip / npm 继续装完。这条
+# fail-soft 规则是有意的 —— 装环境失败不该让用户连工作台都打不开。
+tool_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# WSL 的 interop PATH 会把 Windows 的 node / npm / pnpm 混进 Linux PATH（/mnt/c/...）。
+# 用它们装 Linux 依赖只会装坏：pnpm 会按 Windows 路径建 node_modules，openclaw 会装进
+# Windows 的 node 目录，最后得到一个「命令都在、一跑就错」的环境。这里只认 Linux 侧的工具。
+native_tool() {
+    local p
+    p="$(command -v "$1" 2>/dev/null)" || return 1
+    [ -n "$p" ] || return 1
+    case "$p" in /mnt/*) return 1 ;; esac
+    return 0
+}
+
+# uv 的官方安装器：只写 $HOME/.local/bin（可用 UV_INSTALL_DIR 覆盖），不需要 sudo。
+# curl 与 wget 都试一下 —— 精简镜像里经常只装了其中一个，而这里失败就得整体退回 pip。
+download_uv_installer() {
+    if tool_exists curl; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif tool_exists wget; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        return 1
+    fi
+}
+
+select_python_tool() {
+    case "${EASEL_PYTHON_TOOL:-auto}" in
+        pip) PY_TOOL=pip; return 0 ;;
+        uv)  PY_TOOL=uv;  return 0 ;;
+    esac
+    PY_TOOL=uv
+    # 没有 pyproject.toml 说明当前目录不是一个可安装的项目（典型场景：只把 setup.sh
+    # 拷出来跑，或者仓库不完整）。这种情况既不该为它建 .venv，也不该让 uv 去解析一个
+    # 不存在的项目 —— uv 会在 `uv pip install -e` 上抛「does not appear to be a Python
+    # project」，比 pip 的报错更难看。这里直接走 pip 分支，由后面的依赖安装 / easel 命令
+    # 检查给出明确结论。
+    if [ ! -f "$PROJECT_ROOT/pyproject.toml" ]; then
+        PY_TOOL=pip
+        warn "未找到 $PROJECT_ROOT/pyproject.toml，跳过 uv 改用 pip 路径"
+        return 0
+    fi
+    native_tool uv && return 0
+    # check 模式只探测、不安装：CI 上没有 uv 也不该在这里联网。
+    if [ "$SETUP_MODE" = check ]; then
+        PY_TOOL=pip
+        return 0
+    fi
+    info "未找到 uv，尝试用户级安装（不写系统目录）..."
+    if run_step 'uv 安装' download_uv_installer >/dev/null 2>&1; then
+        export PATH="$HOME/.local/bin:$PATH"
+        hash -r 2>/dev/null || true
+    fi
+    if native_tool uv; then
+        ok "uv $(uv --version 2>/dev/null | awk '{print $2}')"
+    else
+        PY_TOOL=pip
+        warn "uv 不可用，回退 pip（依赖安装会更慢）"
+    fi
+}
+
+# pnpm 只接管项目内的前端依赖。全局 openclaw 仍用 npm：
+#   · pnpm 的全局 bin 依赖 PNPM_HOME，未配置时装完不在 PATH 上；
+#   · pnpm 10+ 默认拦截依赖的 postinstall，而 openclaw 的 bundled plugins 正是靠
+#     自己的 postinstall 展开 —— 用 pnpm 装它更容易装出「能跑但插件缺失」的半成品。
+select_node_tool() {
+    case "${EASEL_NODE_TOOL:-auto}" in
+        npm)  NODE_TOOL=npm;  return 0 ;;
+        pnpm) NODE_TOOL=pnpm; return 0 ;;
+    esac
+    NODE_TOOL=pnpm
+    native_tool pnpm && return 0
+    if [ "$SETUP_MODE" = check ]; then
+        NODE_TOOL=npm
+        return 0
+    fi
+    info "未找到 pnpm，尝试安装..."
+    if run_step 'pnpm 安装' \
+        npm install -g pnpm@latest --loglevel warn "${NPM_REGISTRY_ARGS[@]}" >/dev/null 2>&1; then
+        hash -r 2>/dev/null || true
+    fi
+    if ! native_tool pnpm; then
+        # npm 全局 bin 未必已在 PATH 上（Homebrew、自装 Node 都这样）
+        local global_bin
+        global_bin="$(npm prefix -g 2>/dev/null)/bin"
+        if [ -x "$global_bin/pnpm" ]; then
+            export PATH="$global_bin:$PATH"
+        fi
+    fi
+    if native_tool pnpm; then
+        ok "pnpm $(pnpm --version 2>/dev/null)"
+    else
+        NODE_TOOL=npm
+        warn "pnpm 不可用，前端回退 npm（依赖安装会更慢）"
+    fi
+}
+
+select_python_tool
+
 step "1/8" "检查系统环境" "Python · Node.js · Git · FFmpeg"
 info "检查 Node.js..."
 node_version_ok() {  # $1=major $2=minor
@@ -364,7 +508,7 @@ node_version_ok() {  # $1=major $2=minor
         || [ "$1" -ge 27 ]
 }
 NODE_OK=false
-if command -v node &>/dev/null; then
+if native_tool node; then
     NODE_VER=$(node -v | sed 's/v//')
     NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
     NODE_MINOR=$(echo "$NODE_VER" | cut -d. -f2)
@@ -452,28 +596,57 @@ else
     echo "未找到 python3；Easel 需要 Python 3.10+。" >&2
     exit 1
 fi
+# 建 venv：uv 能用就用 uv。uv 自己带 Python 发现与 pip seed，不依赖系统的
+# ensurepip —— 精简镜像（未装 python3-venv）下 `python3 -m venv` 必失败，这条路径
+# 正是为了那种环境存在的。
+create_project_venv() {
+    mkdir -p "$PROJECT_ROOT" 2>/dev/null || true
+    if [ "$PY_TOOL" = uv ] && tool_exists uv; then
+        # --seed 让 venv 里带 pip：既保住用户 `pip install` 的习惯，也让以后
+        # EASEL_PYTHON_TOOL=pip 复用同一个 venv 时不至于没有 pip。
+        if uv venv --seed "$PROJECT_ROOT/.venv" >/dev/null 2>&1; then
+            return 0
+        fi
+        warn "uv venv --seed 失败，改用不带 seed 的 uv venv"
+        if uv venv "$PROJECT_ROOT/.venv"; then
+            return 0
+        fi
+        # 两条 uv 路径都失败时不能直接退出：系统 python3 的 venv 是最后一条 fail-soft
+        # 路径（它可能因缺 python3-venv 也失败，那时下面会给出安装提示）。
+        warn "uv 创建 venv 失败，回退 python3 -m venv"
+    fi
+    if ! python3 -c 'import venv' >/dev/null 2>&1; then
+        echo "当前 Python 缺少 venv 模块，无法创建虚拟环境。" >&2
+        echo "Debian/Ubuntu 请运行：sudo apt install python3-venv" >&2
+        echo "RHEL/CentOS 请安装对应的 python3 virtualenv/venv 包后重试。" >&2
+        exit 1
+    fi
+    python3 -m venv "$PROJECT_ROOT/.venv"
+}
+
 if [ -t 0 ]; then
     USE_VENV="$(ask '使用项目虚拟环境 .venv 安装 Python 依赖？[Y/n]')"
     case "${USE_VENV:-Y}" in
         n|N) warn "将使用当前 Python 环境" ;;
         *)
             if [ ! -x "$PROJECT_ROOT/.venv/bin/python" ]; then
-                if ! python3 -c 'import venv' >/dev/null 2>&1; then
-                    echo "当前 Python 缺少 venv 模块，无法创建虚拟环境。" >&2
-                    echo "Debian/Ubuntu 请运行：sudo apt install python3-venv" >&2
-                    echo "RHEL/CentOS 请安装对应的 python3 virtualenv/venv 包后重试。" >&2
-                    exit 1
+                if [ "$PY_TOOL" = uv ]; then
+                    info "创建虚拟环境 .venv（uv）..."
+                else
+                    info "创建虚拟环境 .venv..."
                 fi
-                info "创建虚拟环境 .venv..."
-                python3 -m venv "$PROJECT_ROOT/.venv"
+                create_project_venv
             fi
             # shellcheck disable=SC1091
             source "$PROJECT_ROOT/.venv/bin/activate"
-            if ! python3 -m pip --version >/dev/null 2>&1; then
+            if [ "$PY_TOOL" = uv ]; then
+                ok "已使用虚拟环境：$PROJECT_ROOT/.venv（uv）"
+            elif ! python3 -m pip --version >/dev/null 2>&1; then
                 echo "虚拟环境已创建但缺少 pip，请检查系统 Python 的 ensurepip/venv 包后重试。" >&2
                 exit 1
+            else
+                ok "已使用虚拟环境：$PROJECT_ROOT/.venv"
             fi
-            ok "已使用虚拟环境：$PROJECT_ROOT/.venv"
             ;;
     esac
 elif [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
@@ -481,6 +654,13 @@ elif [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
     # shellcheck disable=SC1091
     source "$PROJECT_ROOT/.venv/bin/activate"
     info "检测到 .venv，非交互模式自动使用项目虚拟环境"
+elif [ "$SETUP_MODE" != check ] && [ "$PY_TOOL" = uv ] && tool_exists uv; then
+    # 非交互（CI / 管道）且没有 .venv：有了 uv 就没必要再退回系统 Python。
+    info "非交互模式未找到 .venv，用 uv 创建项目虚拟环境"
+    create_project_venv
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.venv/bin/activate"
+    ok "已使用虚拟环境：$PROJECT_ROOT/.venv（uv）"
 else
     warn "当前为非交互模式且未找到 .venv，将使用系统 Python；建议先创建 Python 3.10+ 虚拟环境"
 fi
@@ -631,7 +811,32 @@ if [ "$(id -u)" -eq 0 ]; then
     PIP_ARGS+=(--root-user-action=ignore)
     warn "当前以 root 安装；生产服务器建议使用虚拟环境"
 fi
-run_step 'pip install' run_with_progress "Python 依赖安装" python3 -m pip "${PIP_ARGS[@]}"
+# uv 用自己的 resolver：--python 显式指向项目 venv（不依赖 activate），镜像用
+# --index-url（uv 没有 -i，也没有 --prefer-binary —— 它默认就优先 wheel）。
+if [ "$PY_TOOL" = uv ] && tool_exists uv && [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+    INSTALL_CMD=(uv pip install -e "$PROJECT_ROOT" --python "$PROJECT_ROOT/.venv/bin/python")
+    if [ -n "${PIP_INDEX_ARGS[0]:-}" ]; then
+        INSTALL_CMD+=(--index-url "${PIP_INDEX_ARGS[1]}")
+    fi
+else
+    INSTALL_CMD=(python3 -m pip "${PIP_ARGS[@]}")
+fi
+# uv 走的是另一套 resolver，失败原因也另一套（索引不可达、缓存损坏、对「不像 Python
+# 项目」的目录更严格）。装不上就退回 pip 重试一次 —— 这是本脚本从一开始就承诺的
+# fail-soft：工具只是加速手段，不该因为它失败就让整个安装停在这一步。原来这条命令裸跑，
+# set -e 会把 uv 的任何非零退出直接变成安装中止。
+INSTALL_OK=false
+if run_step 'pip install' run_with_progress "Python 依赖安装" "${INSTALL_CMD[@]}"; then
+    INSTALL_OK=true
+elif [ "$PY_TOOL" = uv ] && tool_exists uv; then
+    warn "uv 安装依赖失败，回退 pip 重试（会更慢）"
+    if run_step 'pip install (fallback)' run_with_progress "Python 依赖安装" python3 -m pip "${PIP_ARGS[@]}"; then
+        INSTALL_OK=true
+    fi
+fi
+if [ "$INSTALL_OK" != true ] && [ "$SETUP_MODE" != check ]; then
+    fatal "Python 依赖安装失败（${PY_TOOL} 与 pip 都试过了）；请检查网络与索引设置后重试"
+fi
 # check 模式下 pip 安装被跳过，easel 自然不会出现 —— 这里不能当成失败，否则 check
 # 模式必然在第 5 步中断，整个「不下载依赖也能验证安装逻辑」的用途就没了。
 if [ "$SETUP_MODE" != check ] && ! command -v easel >/dev/null 2>&1; then
@@ -645,15 +850,35 @@ info "构建 Web 前端..."
 if [ -d "$PROJECT_ROOT/web/frontend" ]; then
     if [ "$SETUP_MODE" = check ]; then
         emit_action run_step '前端依赖与构建' '依赖安装 + production bundle'
-    elif ! (
-        cd "$PROJECT_ROOT/web/frontend"
-        if [ -f package-lock.json ]; then npm ci --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}" || npm install --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}"; else npm install --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}"; fi
-        npm run build
-    ); then
-        echo "前端依赖安装或构建失败；请检查 Node.js/npm 网络后重新运行 bash setup.sh。" >&2
-        exit 1
+    else
+        select_node_tool
+        if ! (
+            cd "$PROJECT_ROOT/web/frontend"
+            if [ "$NODE_TOOL" = pnpm ]; then
+                # pnpm 与 npm 的 node_modules 布局不兼容（符号链接 vs 扁平复制），
+                # 从 npm 切过来时必须先清掉，否则 pnpm 会对着旧的扁平目录做增量。
+                if [ -f node_modules/.package-lock.json ]; then
+                    rm -rf node_modules
+                fi
+                if [ -f pnpm-lock.yaml ]; then
+                    pnpm install --frozen-lockfile "${NPM_REGISTRY_ARGS[@]}"
+                else
+                    pnpm install "${NPM_REGISTRY_ARGS[@]}"
+                fi
+                pnpm run build
+            elif [ -f package-lock.json ]; then
+                npm ci --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}" || npm install --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}"
+                npm run build
+            else
+                npm install --no-audit --no-fund "${NPM_REGISTRY_ARGS[@]}"
+                npm run build
+            fi
+        ); then
+            echo "前端依赖安装或构建失败；请检查 Node.js / ${NODE_TOOL} 网络后重新运行 bash setup.sh。" >&2
+            exit 1
+        fi
     fi
-    ok "前端已构建 → web/frontend/dist/"
+    ok "前端已构建 → web/frontend/dist/（${NODE_TOOL:-npm}）"
 else
     echo "未找到 web/frontend，无法完成 Web 工作台安装。" >&2
     exit 1
@@ -1143,19 +1368,38 @@ if [ "$SETUP_MODE" = check ]; then
     # check 模式跳过了 pip 安装，playwright 模块自然不在。这里不能当成失败，否则
     # check 模式必然在最后一步中断 —— 与上面 easel 命令那处同理。
     emit_action run_step 'playwright chromium' 'python3 -m playwright install chromium'
+    emit_action run_step 'playwright deps' 'sudo python3 -m playwright install-deps chromium'
 elif python3 -c 'import playwright' >/dev/null 2>&1; then
     # 降级而非中断：这是个 ~300MB 的下载，弱网下失败很常见，而它只影响浏览器登录/发布。
     CHROMIUM_OK=true
     run_step 'playwright chromium' python3 -m playwright install chromium || CHROMIUM_OK=false
-    if [ "$CHROMIUM_OK" = true ] && [ "$SETUP_MODE" != check ]; then
-        python3 -c 'from pathlib import Path; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); path=Path(p.chromium.executable_path); p.stop(); raise SystemExit(0 if path.is_file() else 1)' \
-            || CHROMIUM_OK=false
-    fi
+
+    # 只下浏览器本体不够：缺 libnss3 / libnspr4 / libasound2 时进程启动即 127。
+    # 这一步需要 root；拿不到 root 不算安装失败 —— 下面的自检会把真实影响报出来。
     if [ "$CHROMIUM_OK" = true ]; then
-        ok "Playwright Chromium 已就绪"
-    else
-        warn_collect 'Playwright Chromium' '下载或校验失败，浏览器登录/发布不可用' \
-            'python3 -m playwright install chromium'
+        DEPS_STATUS=0
+        run_step 'playwright 系统依赖' playwright_system_deps python3 || DEPS_STATUS=$?
+        case "$DEPS_STATUS" in
+            0) : ;;
+            2) warn_collect 'Playwright 系统依赖' '需要 root 权限安装浏览器系统库（libnss3 / libnspr4 / libasound2）' \
+                   'sudo python3 -m playwright install-deps chromium' high ;;
+            *) warn_collect 'Playwright 系统依赖' '安装失败，浏览器可能无法启动' \
+                   'sudo python3 -m playwright install-deps chromium' ;;
+        esac
+    fi
+
+    # 真启动一次。以前这里只判可执行文件存在，于是安装全绿、用户点「登录」才看到
+    # 「浏览器没能打开」—— 日志里是 libnspr4.so: cannot open shared object file。
+    if [ "$CHROMIUM_OK" = true ]; then
+        if run_step 'chromium 启动自检' playwright_launch_selfcheck python3; then
+            ok "Playwright Chromium 已就绪（启动自检通过）"
+        else
+            CHROMIUM_OK=false
+        fi
+    fi
+    if [ "$CHROMIUM_OK" = false ]; then
+        warn_collect 'Playwright Chromium' '下载、系统依赖或启动自检失败，浏览器登录/发布不可用' \
+            'python3 -m playwright install chromium && sudo python3 -m playwright install-deps chromium'
     fi
 else
     # 这个仍然致命：playwright 模块缺失意味着 pip 安装没装全，不是网络抖动。
@@ -1165,7 +1409,7 @@ fi
 write_install_report
 print_summary
 if [ "$SKIP_OPENCLAW" = true ]; then
-    echo -e "\n  ${CYAN}下一步：easel web → 设置 → Agent 底座 → 执行引擎${NC}"
+    echo -e "\n  ${CYAN}下一步：easel up → 设置 → Agent 底座 → 执行引擎${NC}"
     echo -e "  ${DIM}选择检测到的 Codex / OpenCode 并保存，再新建对话；原生认证由对应 CLI 管理。${NC}"
     echo -e "  ${DIM}新安装默认仅聊天模式，配置模型 API 后可聊天；不会自动执行文件或浏览器工具。${NC}"
     echo -e "  ${DIM}以后需要 OpenClaw，可运行 bash setup.sh --openclaw，再在 Web 设置切换。${NC}"
@@ -1173,9 +1417,9 @@ elif [ "${MODEL_CONFIGURED:-false}" = false ]; then
     echo ""
     echo -e "  ${YELLOW}下一步：在浏览器里配置模型${NC}"
     if [ -x "$PROJECT_ROOT/.venv/bin/easel" ]; then
-        echo -e "    1. ${CYAN}source .venv/bin/activate && easel web${NC}"
+        echo -e "    1. ${CYAN}.venv/bin/easel up${NC}"
     else
-        echo -e "    1. ${CYAN}easel web${NC}"
+        echo -e "    1. ${CYAN}easel up${NC}"
     fi
     echo -e "    2. 打开 ${CYAN}http://localhost:7860${NC}"
     echo -e "    3. 左下角${CYAN}设置${NC} → ${CYAN}模型配置${NC} → 填 API Key → 保存"
@@ -1184,15 +1428,25 @@ elif [ "${MODEL_CONFIGURED:-false}" = false ]; then
     fi
     echo -e "  ${DIM}也可以直接编辑 .env 填 key，然后运行 easel doctor 复检。${NC}"
 fi
-echo -e "\n  ${CYAN}开始使用：${NC}"
+echo -e "\n  ${CYAN}开始使用（不需要先激活 venv）：${NC}"
 if [ -x "$PROJECT_ROOT/.venv/bin/easel" ]; then
-    echo -e "    ${CYAN}source .venv/bin/activate${NC}    # 先激活虚拟环境，easel 命令才可用"
-    echo -e "    ${DIM}# 新开终端都要先激活；或不激活直接用 .venv/bin/easel <命令>${NC}"
+    echo "    .venv/bin/easel up           # 启动 gateway + Web 工作台（Ctrl+C 一起停）"
+    echo "    .venv/bin/easel web          # 只启动 Web 工作台"
+    echo "    .venv/bin/easel chat         # 终端对话"
+    echo "    .venv/bin/easel doctor       # 检查环境"
+    echo "    .venv/bin/easel ping         # 当前模式连通性"
+    if [ "$PY_TOOL" = uv ]; then
+        echo -e "    ${DIM}# 等价写法（项目根目录）：uv run --no-sync easel up${NC}"
+        echo -e "    ${DIM}# 不加 --no-sync 的 uv run 会同步环境并生成 uv.lock，那是真正的依赖解析${NC}"
+    fi
+    echo -e "    ${DIM}# 想让 easel / pip / playwright 直接可用：source .venv/bin/activate${NC}"
+else
+    echo "    easel up                     # 启动 gateway + Web 工作台（Ctrl+C 一起停）"
+    echo "    easel web                    # 只启动 Web 工作台"
+    echo "    easel chat                   # 终端对话"
+    echo "    easel doctor                 # 检查环境"
+    echo "    easel ping                   # 当前模式连通性"
 fi
-echo "    easel web                    # 启动 Web 工作台"
-echo "    easel chat                   # 终端对话"
-echo "    easel doctor                 # 检查环境"
-echo "    easel ping                   # 当前模式连通性"
 if [ "$CHAT_MODE" != "api" ]; then
     echo -e "\n  ${DIM}Easel profile：~/.openclaw-${PROFILE}/${NC}"
 fi

@@ -1,0 +1,9 @@
+# Line endings are load-bearing here: setup.sh is executed by bash on Linux/macOS/WSL,
+# and a CRLF checkout makes it fail with `$'\r': command not found` — the classic
+# "cloned on Windows, ran in WSL" failure. Keep shell scripts LF in every checkout.
+*.sh                text eol=lf
+*.bash              text eol=lf
+
+# Lockfiles are compared byte-for-byte by `npm ci` / `pnpm --frozen-lockfile`.
+package-lock.json   text eol=lf
+pnpm-lock.yaml      text eol=lf

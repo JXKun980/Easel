@@ -108,12 +108,44 @@ def _venv_available() -> bool:
 
 
 def _chromium_available() -> bool:
+    """真启动一次 headless Chromium 再判可用性。
+
+    只判断可执行文件存在是不够的：Playwright 的 Chromium 是动态链接到系统库的，
+    最小化的 Ubuntu/Debian 上缺 ``libnss3`` / ``libnspr4`` / ``libasound2`` 时，
+    文件明明在、``playwright install chromium`` 也报成功，但进程启动即退出码 127，
+    Playwright 只抛「Target page, context or browser has been closed」。
+    那时 doctor 一路绿灯，用户点「登录」才看到「浏览器没能打开」（日志在
+    outputs/_login/）。真启动一次约 0.5-1.5s，换掉这个静默盲区是值得的。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as playwright:
+            if not Path(playwright.chromium.executable_path).is_file():
+                return False
+            browser = playwright.chromium.launch(headless=True, timeout=20_000)
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001  关不掉不影响「能启动」这个结论
+                pass
+        return True
+    except Exception:  # noqa: BLE001  Playwright 的异常层级跨版本会变，统一按起不来处理
+        return False
+
+
+def _chromium_hint() -> str:
+    """失败提示要能区分「没下载」和「下载了但起不来」，否则用户会反复重下。"""
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
-            return Path(playwright.chromium.executable_path).is_file()
-    except (ImportError, OSError, RuntimeError):
-        return False
+            if Path(playwright.chromium.executable_path).is_file():
+                return ("浏览器已下载但无法启动，多为缺少系统库（libnss3 / libnspr4 / "
+                        "libasound2）：sudo python3 -m playwright install-deps chromium")
+    except Exception:  # noqa: BLE001  探测本身失败就退回「安装浏览器」这条
+        pass
+    return "运行 python3 -m playwright install chromium"
 
 
 def _gateway_healthy() -> bool:
@@ -483,8 +515,9 @@ def cmd_doctor(_args) -> int:
     frontend_ready = (PROJECT_ROOT / "web" / "frontend" / "dist" / "index.html").is_file()
     all_ok &= _check("Web frontend build", frontend_ready,
                       "运行 cd web/frontend && npm ci && npm run build")
-    all_ok &= _check("Playwright Chromium", _chromium_available(),
-                      "运行 python3 -m playwright install chromium")
+    chromium_ok = _chromium_available()
+    all_ok &= _check("Playwright Chromium", chromium_ok,
+                      "" if chromium_ok else _chromium_hint())
 
     if direct and not alternate:
         try:

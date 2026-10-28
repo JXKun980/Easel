@@ -218,9 +218,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
 ```
 
-Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.16+（24.x）、26.1+（26.x）或 27+、Git 和 FFmpeg；25.x 与 26.0 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
+Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、Node.js 24.16+（24.x）、26.1+（26.x）或 27+、Git 和 FFmpeg；25.x 与 26.0 不兼容。如果系统没有 `winget`，再使用官方安装器安装并加入 PATH。随后安装器会创建项目内 `.venv`，安装 Python/Node 依赖、前端生产包和 Playwright Chromium，并使用独立的 `easel` OpenClaw profile。Python 依赖优先用 `uv` 安装（缺失时自动装到用户目录），装不上会自动回退 `pip`；两者都失败才中止。安装完成后可运行 `.venv\Scripts\easel.exe doctor` 检查环境。
 
-安装器支持 Windows 自带的 PowerShell 5.1，安装后可直接运行 `.venv\Scripts\easel.exe web` 启动工作台。原生安装与 Web/CLI 入口已经提供；各技能及浏览器发布的 Windows 全链路兼容仍在持续完善。
+安装器支持 Windows 自带的 PowerShell 5.1，安装后可直接运行 `.venv\Scripts\easel.exe up` 一次启动 gateway 与 Web 工作台（`web` 只启动 Web）。原生安装与 Web/CLI 入口已经提供；各技能及浏览器发布的 Windows 全链路兼容仍在持续完善。
 
 `bash setup.sh` 是可重复运行的引导式安装器，直接执行即可，不需要先手动安装 Easel 依赖。安装过程中会：
 
@@ -234,20 +234,41 @@ Windows 安装器会优先通过 `winget` 自动安装缺失的 Python 3.10+、N
 
 安装器全程非交互（只有「是否创建 `.venv`」一问，非交互环境下按默认值），适合 CI 与自动化。非致命问题（FFmpeg、Chromium、gateway 启动、模型未配置等）会收集起来在结尾汇总，并写入 `outputs/_install/last-install.json` 供 `easel doctor` 复述，安装本身仍以 0 退出。若希望这些问题直接让安装失败，设 `EASEL_SETUP_STRICT=1`。
 
-安装完成后，`easel` 命令安装在项目的 `.venv` 中。先激活虚拟环境再运行（每次新开终端都要先激活）：
+安装完成后，`easel` 命令安装在项目的 `.venv` 里。**不需要先激活虚拟环境** —— 入口脚本的
+shebang 指向 `.venv/bin/python`（Windows 为 `.venv\Scripts\easel.exe`），直接跑就可以：
 
 ```bash
-source .venv/bin/activate    # 激活后 easel 命令才可用（Windows：.venv\Scripts\activate）
-easel doctor                 # 检查运行环境
-easel ping                   # 实际测试 gateway 和 Agent
-easel web                    # 启动 Web 工作台
-# 或：easel chat              # 启动终端对话
+.venv/bin/easel doctor       # 检查运行环境
+.venv/bin/easel ping         # 实际测试 gateway 和 Agent
+.venv/bin/easel up           # 一次启动 gateway + Web 工作台（Ctrl+C 一起停）
+.venv/bin/easel web          # 只启动 Web 工作台
+.venv/bin/easel chat         # 终端对话
 ```
 
-> 如果提示 `easel: command not found`，就是虚拟环境没激活。也可以不激活、直接用完整路径运行，例如 `.venv/bin/easel doctor`（Windows：`.venv\Scripts\easel.exe doctor`）。
+`easel up` 是日常启动入口：先确保 OpenClaw gateway 就绪（已在运行则直接复用），再起 Web
+工作台；Ctrl+C 只停本次自己启动的 gateway，不会误杀你另一个终端里跑着的那个。
 
-启动 Web 工作台后访问 `http://localhost:7860`。安装完成后可以运行 `easel doctor` 检查环境，
-运行 `easel ping` 检查 gateway 和 Agent 连通性。
+用 uv 时的标准写法是带 `--no-sync`（在项目根目录执行，或在任意目录加 `--project <项目路径>`）：
+
+```bash
+uv run --no-sync easel up    # 复用项目 .venv，不重新解析依赖
+```
+
+> 不加 `--no-sync` 时，`uv run` 会按 `pyproject.toml` 同步环境并生成 `uv.lock` —— 那是一次
+> 真正的依赖解析（本项目会多出 1MB+ 的 lockfile），而不只是「跑个命令」。本项目刻意不提交
+> `uv.lock`（已加入 `.gitignore`），所以请保持带 `--no-sync`；需要可复现的锁定环境时再自行
+> 生成并纳入版本管理。
+
+只有想让 `easel`、`pip`、`playwright` 这些命令直接出现在 PATH 上时，才需要激活：
+
+```bash
+source .venv/bin/activate    # Windows：.venv\Scripts\activate
+```
+
+启动 Web 工作台后访问 `http://localhost:7860`。端口可以用 `--port` 改，也可以在 `.env` 里写
+`EASEL_PORT=8188` 让 `easel up` / `easel web` 默认用它（在 WSL 里尤其需要：Windows 保留的
+7409–7979 端口段会让 `localhost:7860` 无法从 Windows 侧转发）。安装完成后可以运行
+`easel doctor` 检查环境，运行 `easel ping` 检查 gateway 和 Agent 连通性。
 
 如果 Easel 运行在 VSCode Remote SSH 连接的服务器上，需要在 VSCode 的“端口”面板
 转发服务器端口 `7860`，再打开面板显示的本地转发地址（本地端口可能不同）。
@@ -256,11 +277,33 @@ easel web                    # 启动 Web 工作台
 安装器会统一安装 Web、媒体处理和浏览器发布所需的 Python 依赖：
 
 ```bash
-python3 -m venv .venv
+# 推荐：uv 建环境并装依赖（比 pip 快一个量级，且不依赖系统自带的 ensurepip）
+uv venv --seed .venv
 source .venv/bin/activate
+uv pip install -e .
+python -m playwright install chromium
+
+# 没有 uv 时的等价写法
+python3 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -e .
 python3 -m playwright install chromium
 # 手动安装时仍需提前安装 ffmpeg
+```
+
+安装器默认优先使用 **uv**（Python 依赖）与 **pnpm**（`web/frontend` 前端依赖），缺失时
+自动装到用户目录，装不上则回落 pip / npm —— 两条回退路径与原来行为一致。全局的
+OpenClaw 仍由 npm 安装（pnpm 的全局 bin 依赖 `PNPM_HOME`，且默认拦截 postinstall，
+而 openclaw 的 bundled plugins 依赖它）。需要强制指定时：
+
+```bash
+EASEL_PYTHON_TOOL=pip EASEL_NODE_TOOL=npm bash setup.sh   # 强制旧的 pip/npm 路径
+EASEL_PYTHON_TOOL=uv  EASEL_NODE_TOOL=pnpm bash setup.sh  # 强制 uv/pnpm（缺失即报错）
+```
+
+前端手动构建同样可以用 pnpm：
+
+```bash
+cd web/frontend && pnpm install --frozen-lockfile && pnpm run build
 ```
 
 ## ⚙️ 配置说明
@@ -337,7 +380,8 @@ API 直连模式不提供此 OpenClaw 专用开关。
 
 | 命令 | 作用 |
 |---|---|
-| `easel web [--port 7860]` | 启动 Web 工作台 |
+| `easel up [--port 7860]` | 一次启动 gateway + Web 工作台（Ctrl+C 一起停；`--keep-gateway` 保留网关） |
+| `easel web [--port 7860]` | 只启动 Web 工作台，不碰 gateway |
 | `easel chat` | 在终端开启多轮对话并选择账号画像 |
 | `easel skill <name> -i "..." [-p <画像>]` | 直接运行指定 Skill；输入也可以是文件路径 |
 | `easel doctor` | 检查 Python、Node.js、OpenClaw 和关键配置 |
